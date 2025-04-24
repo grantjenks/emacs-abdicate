@@ -243,16 +243,16 @@ In noninteractive mode, the goal is taken from `command-line-args-left`."
          (done nil))
     (unless (string-empty-p goal)
       (catch 'stop
-        (while (not done)
+        (while t
           (let* ((snapshot (abdicate--snapshot))
                  (reply    (abdicate--query goal snapshot))
                  (cmds     (abdicate--get 'commands reply))
-                 (cont     (or (abdicate--get 'continue reply) t)))
+                 (cont     (abdicate--get 'continue reply)))
             (unless (or (listp cmds) (vectorp cmds))
               (error "Assistant JSON missing commands"))
             (dolist (c (if (vectorp cmds) (append cmds nil) cmds))
               (abdicate--eval c))
-            (unless cont (throw 'stop t))))))))
+            (unless (eq cont t) (throw 'stop t))))))))
 
 (provide 'abdicate)
 
