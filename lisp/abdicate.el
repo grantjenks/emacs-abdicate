@@ -46,6 +46,15 @@
   (message "[abdicate] HTTP response status: %S" status))
 
 ;; ------------------------------------------------------------------------
+;; Helper: robust JSON key lookup.
+;; ------------------------------------------------------------------------
+(defun abdicate--get (key alist)
+  "Retrieve the value associated with KEY from ALIST.
+Try both symbol and string versions of KEY."
+  (or (alist-get key alist)
+      (alist-get (symbol-name key) alist nil nil #'string=)))
+
+;; ------------------------------------------------------------------------
 ;; Snapshot builders
 ;; ------------------------------------------------------------------------
 
@@ -248,11 +257,11 @@ In noninteractive mode, the goal is taken from `command-line-args-left`."
         (while (not done)
           (let* ((snapshot (abdicate--snapshot))
                  (reply    (abdicate--query goal snapshot))
-                 (cmds     (alist-get 'commands reply))
-                 (cont     (alist-get 'continue reply t)))
-            (unless (listp cmds)
+                 (cmds     (abdicate--get 'commands reply))
+                 (cont     (or (abdicate--get 'continue reply) t)))
+            (unless (or (listp cmds) (vectorp cmds))
               (error "Assistant JSON missing commands"))
-            (dolist (c cmds)
+            (dolist (c (if (vectorp cmds) (append cmds nil) cmds))
               (abdicate--eval c))
             (unless cont (throw 'stop t))))))))
 
