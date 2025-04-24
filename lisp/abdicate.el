@@ -12,7 +12,6 @@
 ;; remote model.  Use only in disposable sessions and backed‑up projects.
 ;; ------------------------------------------------------------------------
 
-(require 'request)
 (require 'json)
 (require 'subr-x)
 (require 'cl-lib)
@@ -96,6 +95,7 @@ Use built‑in commands only.  Return `continue=false` when done.")
 
 (defun abdicate--query (goal snapshot)
   "POST GOAL + SNAPSHOT; return parsed assistant JSON."
+  (require 'request)
   (let* ((input `[((type . "message") (role . "system")
                    (content . ,(abdicate--system-prompt)))
                   ((type . "message") (role . "user") (content . ,goal))

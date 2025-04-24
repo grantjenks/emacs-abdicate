@@ -1,4 +1,6 @@
-EMACS ?= emacs -Q --batch -L lisp
+# Locate emacs on PATH or fall back to the Mac App bundle binary
+EMACS ?= $(shell command -v emacs 2>/dev/null || echo /Applications/Emacs.app/Contents/MacOS/Emacs) -Q --batch -L lisp
+.PHONY: test smoke bench
 
 test:
 	$(EMACS) -l lisp/abdicate.el -l test/abdicate-test.el -f ert-run-tests-batch-and-exit
@@ -8,8 +10,8 @@ smoke:
 	$(EMACS) --script scripts/run-abdicate.el
 
 bench:
-	EMACS_BATCH="emacs -Q -batch -L lisp" ;\
-	$$EMACS_BATCH -l lisp/abdicate.el -l lisp/abdicate-bench.el \
-	              -f ert-run-tests-batch-and-exit ;\
+	# Run benchmarks (using the same EMACS invocation) and then print stats
+	$(EMACS) -l lisp/abdicate.el -l lisp/abdicate-bench.el \
+		-f ert-run-tests-batch-and-exit ;\
 	echo "Stats:" ;\
-	$$EMACS_BATCH --eval "(princ abdicate-bench-stats)"
+	$(EMACS) --eval "(princ abdicate-bench-stats)"
