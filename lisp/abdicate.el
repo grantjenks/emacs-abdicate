@@ -1,7 +1,7 @@
 ;;; abdicate.el --- LLM‑driven Emacs agent (Responses API) -*- lexical-binding: t; -*-
 ;; Author: Grant Jenks <grant@example.com>
-;; Version: 0.3.0
-;; Package‑Requires: ((emacs "28.1") (request "0.3.2") (json "1.5") (cl-lib "0.6"))
+;; Version: 0.3.1
+;; Package‑Requires: ((emacs "28.1") (json "1.5") (cl-lib "0.6"))
 ;; Keywords: tools, convenience, ai
 ;; URL: https://github.com/YOURUSER/emacs-abdicate
 ;;
@@ -15,6 +15,7 @@
 (require 'json)
 (require 'subr-x)
 (require 'cl-lib)
+(require 'url)
 
 (defgroup abdicate nil "LLM‑driven editing helpers." :group 'external)
 
@@ -38,11 +39,9 @@
 ;; Debug helper
 ;; ------------------------------------------------------------------------
 
-(defun abdicate--debug-response (resp)
-  "Log HTTP STATUS and body from RESP (a request.el response)."
-  (message "[abdicate] HTTP %s  %S"
-           (request-response-status-code resp)
-           (request-response-data   resp)))
+(defun abdicate--debug-response (status)
+  "Log HTTP response STATUS for debugging."
+  (message "[abdicate] HTTP response status: %S" status))
 
 ;; ------------------------------------------------------------------------
 ;; Snapshot builders
@@ -87,36 +86,52 @@ Each command is evaluated with `(eval)`. \
 Use built‑in commands only.  Return `continue=false` when done.")
 
 (defun abdicate--json (obj)
-  (let ((json-encoding-pretty-print nil)) (json-encode obj)))
+  (let ((json-encoding-pretty-print nil))
+    (json-encode obj)))
 
 ;; ------------------------------------------------------------------------
-;; API call (Responses API, 2025)
+;; API call (Responses API, 2025) using built-in URL package instead of request
 ;; ------------------------------------------------------------------------
 
 (defun abdicate--query (goal snapshot)
-  "POST GOAL + SNAPSHOT; return parsed assistant JSON."
-  (require 'request)
+  "POST GOAL + SNAPSHOT; return parsed assistant JSON.
+Uses the built-in `url-retrieve-synchronously` to perform a synchronous HTTP request."
   (let* ((input `[((type . "message") (role . "system")
                    (content . ,(abdicate--system-prompt)))
-                  ((type . "message") (role . "user") (content . ,goal))
-                  ((type . "message") (role . "user") (content . ,snapshot))])
-         (payload (abdicate--json `((model . ,abdicate-model) (input . ,input))))
-         (resp (request
-                 "https://api.openai.com/v1/responses"
-                 :type "POST" :data payload :parser #'json-read
-                 :headers `(("Content-Type"  . "application/json")
-                            ("Authorization" . ,(concat "Bearer " abdicate-api-key)))
-                 :error #'abdicate--debug-response
-                 :sync t)))
-    (let* ((data  (request-response-data resp))
-           (items (alist-get 'output data))
-           (msg   (seq-find (lambda (it) (equal (alist-get 'type it) "message"))
-                            (reverse items))))
-      (unless msg (error "No assistant message in response"))
-      (condition-case _
-          (json-read-from-string (alist-get 'content msg))
-        (json-error
-         (error "Assistant content not JSON: %s" (alist-get 'content msg)))))))
+                  ((type . "message") (role . "user")
+                   (content . ,goal))
+                  ((type . "message") (role . "user")
+                   (content . ,snapshot))])
+         (payload (abdicate--json `((model . ,abdicate-model)
+                                     (input . ,input))))
+         (url "https://api.openai.com/v1/responses"))
+    (setq url-request-method "POST")
+    (setq url-request-extra-headers
+          `(("Content-Type" . "application/json")
+            ("Authorization" . ,(concat "Bearer " abdicate-api-key))))
+    (setq url-request-data payload)
+    (let ((url-buffer (url-retrieve-synchronously url t t)))
+      (unless url-buffer
+        (error "Network error: no response buffer"))
+      (with-current-buffer url-buffer
+        ;; Find the end of HTTP headers.
+        (goto-char (point-min))
+        (if (not (search-forward "\n\n" nil t))
+            (progn
+              (kill-buffer url-buffer)
+              (error "Response format error: header-body separator not found")))
+        (let* ((response-text (buffer-substring-no-properties (point) (point-max)))
+               (data (json-read-from-string response-text))
+               (output (alist-get 'output data))
+               (msg (seq-find (lambda (it) (equal (alist-get 'type it) "message"))
+                              (reverse output))))
+          (kill-buffer url-buffer)
+          (unless msg
+            (error "No assistant message in response"))
+          (condition-case _
+              (json-read-from-string (alist-get 'content msg))
+            (json-error
+             (error "Assistant content not JSON: %s" (alist-get 'content msg)))))))))
 
 ;; ------------------------------------------------------------------------
 ;; Command execution
