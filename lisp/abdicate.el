@@ -169,7 +169,6 @@ to perform a synchronous HTTP request."
                 (kill-buffer url-buffer)
                 (error "Response format error: header-body separator not found"))
               (let* ((response-text (buffer-substring-no-properties (point) (point-max))))
-                (message "Assistant raw response: %s" response-text)
                 (let* ((data (condition-case err
                                  (json-read-from-string response-text)
                                (json-error
@@ -196,8 +195,7 @@ to perform a synchronous HTTP request."
 (defun abdicate--eval (cmd)
   "Read and evaluate CMD string.
 Logs the command before evaluation. If evaluation fails, records the error
-message in the snapshot and retries once.
-In noninteractive mode the command is always auto-confirmed."
+message. In noninteractive mode the command is always auto-confirmed."
   (condition-case outer
       (let ((form (read cmd)))
         (message "Command to eval: %S" form)
@@ -212,22 +210,13 @@ In noninteractive mode the command is always auto-confirmed."
                  (let ((err-msg (format "Error evaluating %S: %s" form (error-message-string err))))
                    (message "%s" err-msg)
                    (push err-msg abdicate--errors)
-                   ;; Retry once
-                   (message "Retrying command: %S" form)
-                   (condition-case err2
-                       (progn
-                         (setq result (eval form))
-                         (message "Retry succeeded: %S => %S" form result))
-                     (error
-                      (let ((err-msg2 (format "Retry failed for %S: %s" form (error-message-string err2))))
-                        (message "%s" err-msg2)
-                        (push err-msg2 abdicate--errors)
-                        (setq result nil)))))))
+                   (setq result nil))))
+              result)
           (progn
             (message "Skipping evaluation of: %S" form)
             nil)))
     (error (message "Unexpected error during evaluation of command: %s" (error-message-string outer))
-           nil))))
+           nil)))
 
 ;; ------------------------------------------------------------------------
 ;; Interactive entry point
