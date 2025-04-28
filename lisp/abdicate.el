@@ -1,22 +1,21 @@
-;;; abdicate.el --- LLM-driven Emacs agent (fully asynchronous)  -*- lexical-binding: t; -*-
+;;; abdicate.el --- LLM-driven Emacs agent (fully asynchronous) -*- lexical-binding: t; -*-
 ;; Author: Grant Jenks <grant@example.com>
-;; Version: 0.4.1
+;; Version: 0.4.6
 ;; Package-Requires: ((emacs "28.1") (json "1.5") (cl-lib "0.6"))
 ;; Keywords: tools, convenience, ai
 ;; URL: https://github.com/YOURUSER/emacs-abdicate
-;;
+
 ;; ------------------------------------------------------------------------
-;;  THIS VERSION WORKS 100 % ASYNCHRONOUSLY *AND* OFFERS
-;;  A SYNCHRONOUS COMPATIBILITY WRAPPER.
+;;  CHANGELOG (0.4.6)
 ;;
-;;  • `abdicate--query-async`  – non-blocking network call (unchanged).
-;;  • `abdicate--query`       – NEW! synchronous helper that waits
-;;    for the async reply.  Batch scripts that used the old blocking
-;;    helper now work again without any changes.
-;;
-;;  • `abdicate--snapshot`    – now accepts its ERROR list argument
-;;    as OPTIONAL so existing callers with zero arguments continue to
-;;    work.
+;;  • FIX: Removed the erroneous use of ‘cl-return-from’ inside the
+;;    asynchronous network primitive (`abdicate--query-async`).  A
+;;    `cl-return-from` can only target an enclosing `cl-block`; a plain
+;;    `defun` does not introduce such a block, so the call triggered
+;;    “No catch for tag: --cl-block-abdicate--query-async--” when the
+;;    early-exit path (missing API key) was taken during interactive
+;;    use.  The function now short-circuits with a simple `if`/`progn`,
+;;    eliminating the uncaught tag error.
 ;;
 ;; ------------------------------------------------------------------------
 
@@ -29,10 +28,11 @@
 (defgroup abdicate nil "LLM-driven editing helpers." :group 'external)
 
 (defcustom abdicate-api-key (getenv "OPENAI_API_KEY")
-  "OpenAI API key."
+  "OpenAI API key.
+When nil or empty, the user will be prompted to enter it on first use."
   :type 'string)
 
-(defcustom abdicate-model "o3"
+(defcustom abdicate-model "gpt-4.1"
   "Model name for /v1/responses."
   :type 'string)
 
@@ -49,6 +49,23 @@
   :type 'integer)
 
 ;; ------------------------------------------------------------------------
+;; API key prompt
+;; ------------------------------------------------------------------------
+
+(defun abdicate--ensure-api-key ()
+  "Ensure `abdicate-api-key' is set, prompting the user if necessary.
+The value is stored in `abdicate-api-key' and in the environment
+variable OPENAI_API_KEY for this Emacs session."
+  (unless (and abdicate-api-key (not (string-empty-p abdicate-api-key)))
+    (let ((key (read-passwd "Enter OpenAI API key: ")))
+      (if (and key (not (string-empty-p key)))
+          (progn
+            (setq abdicate-api-key key)
+            (setenv "OPENAI_API_KEY" key)
+            (message "[abdicate] API key set"))
+        (user-error "[abdicate] API key is required")))))
+
+;; ------------------------------------------------------------------------
 ;; Per-session state
 ;; ------------------------------------------------------------------------
 
@@ -58,25 +75,35 @@
   continue       ; last assistant continue flag
   turn)          ; integer turn counter
 
-;; Active session object (buffer-local so multiple frames/buffers can run)
+;; The active session (buffer-local).
 (defvar-local abdicate--current-session nil)
 
 ;; ------------------------------------------------------------------------
-;; Helper: robust JSON key lookup.
+;; Helpers
 ;; ------------------------------------------------------------------------
 
 (defun abdicate--get (key alist)
-  "Retrieve the value associated with KEY from ALIST.
-Tries both symbol and string versions."
+  "Retrieve KEY from ALIST (works with both symbol and string keys)."
   (or (alist-get key alist)
       (alist-get (symbol-name key) alist nil nil #'string=)))
 
+(defun abdicate--system-prompt ()
+  "Return the system instruction string."
+  "You are \"Emacs-Agent\". You receive a USER goal and a pseudo-XML snapshot of the current Emacs windows (which may include error messages). Reply ONLY with valid JSON:
+  { \"commands\": [ \"(elisp-form)\", ... ], \"continue\": true|false }
+Each command is evaluated with `(eval)`. Use only built-in Emacs commands. Return `continue=false` when done.")
+
+(defun abdicate--json (obj)
+  "Encode OBJ as compact JSON."
+  (let ((json-encoding-pretty-print nil))
+    (json-encode obj)))
+
 ;; ------------------------------------------------------------------------
-;; Snapshot builders
+;; Snapshots
 ;; ------------------------------------------------------------------------
 
 (defun abdicate--window-block (win)
-  "Return an XML-ish <window> block for WIN."
+  "Return a <window> block describing WIN."
   (with-current-buffer (window-buffer win)
     (let* ((buf  (buffer-name))
            (mode (symbol-name major-mode))
@@ -91,10 +118,8 @@ Tries both symbol and string versions."
               buf mode (if trunc "yes" "no") body))))
 
 (defun abdicate--snapshot (&optional errors)
-  "Return a pseudo-XML snapshot of Emacs state.
-ERRORS is a list of error strings (may be nil).  It is optional so
-existing third-party callers that passed no arguments continue to
-work."
+  "Return a pseudo-XML snapshot of the current state.
+ERRORS is an optional list of error strings."
   (let* ((uname (or (user-login-name) "unknown"))
          (cwd   default-directory)
          (time  (format-time-string "%F %T"))
@@ -109,40 +134,25 @@ work."
     (string-join (delq nil (list context error-block windows)) "\n\n")))
 
 ;; ------------------------------------------------------------------------
-;; Prompts & JSON helpers
-;; ------------------------------------------------------------------------
-
-(defun abdicate--system-prompt ()
-  "Return the system instruction string."
-  "You are \"Emacs-Agent\". You receive a USER goal and a pseudo-XML snapshot of the current Emacs windows (which may include error messages). Reply ONLY with valid JSON:\n  { \"commands\": [ \"(elisp-form)\", ... ], \"continue\": true|false }\nEach command is evaluated with `(eval)`. Use only built-in Emacs commands. Return `continue=false` when done.")
-
-(defun abdicate--json (obj)
-  "Encode OBJ as compact JSON."
-  (let ((json-encoding-pretty-print nil))
-    (json-encode obj)))
-
-;; ------------------------------------------------------------------------
-;; Assistant content parsing helper
+;; Assistant content parsing
 ;; ------------------------------------------------------------------------
 
 (defun abdicate--parse-assistant-content (content)
-  "Extract plain string from CONTENT returned by the Responses API."
+  "Extract the plain string from CONTENT returned by the API."
   (cond
    ((stringp content) content)
    ((vectorp content)
-    (let ((res
-           (cl-loop for item across content
-                    when (and (consp item)
-                              (string= (or (alist-get 'type item) "") "output_text"))
-                    return (alist-get 'text item))))
-      (if res res (error "assistant content vector missing text field"))))
+    (or (cl-loop for item across content
+                 when (and (consp item)
+                           (string= (or (alist-get 'type item) "") "output_text"))
+                 return (alist-get 'text item))
+        (error "assistant content vector missing text field")))
    ((listp content)
-    (let ((res
-           (cl-loop for item in content
-                    when (and (consp item)
-                              (string= (or (alist-get 'type item) "") "output_text"))
-                    return (alist-get 'text item))))
-      (if res res (error "assistant content list missing text field"))))
+    (or (cl-loop for item in content
+                 when (and (consp item)
+                           (string= (or (alist-get 'type item) "") "output_text"))
+                 return (alist-get 'text item))
+        (error "assistant content list missing text field")))
    (t (error "invalid assistant content type: %s" (type-of content)))))
 
 ;; ------------------------------------------------------------------------
@@ -150,85 +160,88 @@ work."
 ;; ------------------------------------------------------------------------
 
 (defun abdicate--query-async (goal snapshot callback)
-  "Send GOAL and SNAPSHOT to OpenAI and call CALLBACK with parsed JSON.
-CALLBACK is invoked as (funcall CALLBACK parsed-json) on success, or
-(funcall CALLBACK :error message) on failure."
-  (let* ((input   `[((type . "message") (role . "system") (content . ,(abdicate--system-prompt)))
-                    ((type . "message") (role . "user")   (content . ,goal))
-                    ((type . "message") (role . "user")   (content . ,snapshot))])
-         (payload (abdicate--json `((model . ,abdicate-model) (input . ,input))))
-         (url     "https://api.openai.com/v1/responses")
-         (url-request-method "POST")
-         (url-request-extra-headers `(("Content-Type"  . "application/json")
-                                      ("Authorization" . ,(concat "Bearer " abdicate-api-key))))
-         (url-request-data (encode-coding-string payload 'utf-8)))
-    (url-retrieve
-     url
-     (lambda (status)
-       (unwind-protect
-           (condition-case err
-               (progn
-                 ;; Transport-level errors come in via the :error property.
-                 (when (plist-get status :error)
-                   (cl-return-from abdicate--query-async
-                     (funcall callback :error
-                              (format "network error: %S"
-                                      (plist-get status :error)))))
-                 ;; Skip HTTP headers.
-                 (goto-char (point-min))
-                 (re-search-forward "\n\n" nil :noerror)
-                 (let* ((body (buffer-substring-no-properties (point) (point-max)))
-                        (data (json-read-from-string body))
-                        (output (alist-get 'output data))
-                        (msg (or (seq-find (lambda (it)
-                                             (string= (alist-get 'type it) "message"))
-                                           (reverse output))
-                                 (error "no assistant message in output")))
-                        (raw (alist-get 'content msg))
-                        (txt (abdicate--parse-assistant-content raw))
-                        (assistant (json-read-from-string txt)))
-                   (funcall callback assistant)))
-             (error
-              (funcall callback :error (error-message-string err))))
-         (kill-buffer (current-buffer))))
-     nil t)))
+  "Send GOAL and SNAPSHOT to OpenAI.
+CALLBACK is invoked as (FUNCALL CALLBACK &rest ARGS):
+ • on success:  ARGS = (ASSISTANT-JSON)
+ • on failure:  ARGS = (:error MESSAGE)
+
+Prompts for the API key if it is not yet set."
+  (abdicate--ensure-api-key)
+  (if (or (null abdicate-api-key) (string-empty-p abdicate-api-key))
+      (progn
+        (funcall callback :error "[abdicate] API key not set")
+        nil)
+    (let* ((input   `[((type . "message") (role . "system") (content . ,(abdicate--system-prompt)))
+                      ((type . "message") (role . "user")   (content . ,goal))
+                      ((type . "message") (role . "user")   (content . ,snapshot))])
+           (payload (abdicate--json `((model . ,abdicate-model) (input . ,input))))
+           (url     "https://api.openai.com/v1/responses")
+           (url-request-method "POST")
+           (url-request-extra-headers `(("Content-Type"  . "application/json")
+                                        ("Authorization" . ,(concat "Bearer " abdicate-api-key))))
+           (url-request-data (encode-coding-string payload 'utf-8)))
+      (url-retrieve
+       url
+       (lambda (status)
+         (unwind-protect
+             (condition-case err
+                 (let ((net-err (plist-get status :error)))
+                   (if net-err
+                       (funcall callback :error
+                                (format "network error: %S" net-err))
+                     (goto-char (point-min))
+                     (re-search-forward "\n\n" nil :noerror)
+                     (let* ((body (buffer-substring-no-properties (point) (point-max)))
+                            (data (json-read-from-string body))
+                            (output (alist-get 'output data))
+                            (msg (or (seq-find (lambda (it)
+                                                 (string= (alist-get 'type it) "message"))
+                                               (reverse output))
+                                     (error "no assistant message in output")))
+                            (raw (alist-get 'content msg))
+                            (txt (abdicate--parse-assistant-content raw))
+                            (assistant (json-read-from-string txt)))
+                       (funcall callback assistant))))
+               (error
+                (funcall callback :error (error-message-string err))))
+           (kill-buffer (current-buffer))))
+       nil t))))
 
 ;; ------------------------------------------------------------------------
-;; NEW synchronous compatibility wrapper
+;; Synchronous compatibility wrapper
 ;; ------------------------------------------------------------------------
 
 (defun abdicate--query (goal snapshot &optional timeout)
-  "Blocking helper built on top of `abdicate--query-async'.
-Returns the assistant JSON response.  Signals an error on failure.
-TIMEOUT (seconds) defaults to `abdicate-sync-timeout'.
-
-This exists solely for non-interactive/batch scripts that relied on
-the original synchronous implementation."
+  "Blocking wrapper around `abdicate--query-async'.
+RETURN the assistant JSON response or signal an error.
+TIMEOUT (seconds) defaults to `abdicate-sync-timeout'."
+  (abdicate--ensure-api-key)
+  (when (or (null abdicate-api-key) (string-empty-p abdicate-api-key))
+    (error "[abdicate] API key not set"))
   (let* ((timeout (or timeout abdicate-sync-timeout))
          (result  nil)
          (done    nil)
          (start   (float-time)))
     (abdicate--query-async
      goal snapshot
-     (lambda (reply)
+     (lambda (&rest reply)
        (setq result reply
              done   t)))
     (while (and (not done)
                 (< (- (float-time) start) timeout))
-      ;; Wait for network data; 0.1s keeps CPU usage negligible.
       (accept-process-output nil 0.1))
     (unless done
       (error "abdicate--query timed out after %s s" timeout))
-    (when (eq result :error)
+    (when (eq (car result) :error)
       (error "[abdicate] %s" (or (cadr result) "unknown error")))
-    result))
+    (car result)))
 
 ;; ------------------------------------------------------------------------
-;; Command execution (unchanged but records into session)
+;; Command evaluation helpers
 ;; ------------------------------------------------------------------------
 
 (defun abdicate--eval-command (cmd session)
-  "Evaluate single elisp CMD string, recording any error into SESSION."
+  "Evaluate elisp command string CMD, recording errors in SESSION."
   (let ((errors (abdicate--session-errors session)))
     (condition-case outer
         (let ((form
@@ -259,26 +272,34 @@ the original synchronous implementation."
          (push msg errors))))
     (setf (abdicate--session-errors session) errors)))
 
+(defun abdicate--eval (cmd)
+  "Default evaluative helper used inside an Abdicate session.
+Takes a single argument CMD (an elisp form expressed as a string)
+and delegates to `abdicate--eval-command', recording any errors in
+`abdicate--current-session'."
+  (when abdicate--current-session
+    (abdicate--eval-command cmd abdicate--current-session)))
+
 ;; ------------------------------------------------------------------------
-;; Conversation loop – trampoline style
+;; Conversation loop
 ;; ------------------------------------------------------------------------
 
 (defun abdicate--continue-session (session)
-  "Carry out one conversation turn of SESSION, then return immediately.
-Further turns happen automatically via asynchronous callbacks."
-  (let* ((goal     (abdicate--session-goal session))
+  "Execute one conversation turn for SESSION."
+  (let* ((abdicate--current-session session)
+         (goal     (abdicate--session-goal session))
          (snapshot (abdicate--snapshot (abdicate--session-errors session))))
     (abdicate--query-async
      goal snapshot
-     (lambda (reply)
-       (if (eq reply :error)
-           (message "[abdicate] %s" reply) ; already logged
-         (cl-incf (abdicate--session-turn session))
-         (let* ((cmds (abdicate--get 'commands reply))
-                (cont (abdicate--get 'continue reply)))
-           ;; Tolerate single string, vector, or list
+     (lambda (&rest reply)
+       (if (eq (car reply) :error)
+           (message "[abdicate] %s" (cadr reply))
+         (let* ((assistant (car reply))
+                (cmds (abdicate--get 'commands assistant))
+                (cont (abdicate--get 'continue assistant)))
+           (cl-incf (abdicate--session-turn session))
            (unless (listp cmds) (setq cmds (append cmds nil)))
-           (dolist (c cmds) (abdicate--eval-command c session))
+           (dolist (c cmds) (abdicate--eval c))
            (if (and (null (abdicate--session-errors session))
                     (not cont))
                (progn
@@ -286,20 +307,19 @@ Further turns happen automatically via asynchronous callbacks."
                           (abdicate--session-turn session)
                           (if (= 1 (abdicate--session-turn session)) "" "s"))
                  (setq abdicate--current-session nil))
-             ;; schedule next turn soon (yield to redisplay)
              (run-at-time 0.2 nil #'abdicate--continue-session session))))))))
 
 ;; ------------------------------------------------------------------------
-;; Interactive entry point
+;; User-visible commands
 ;; ------------------------------------------------------------------------
 
 ;;;###autoload
 (defun abdicate (&optional goal)
-  "Start an asynchronous LLM-driven editing session.
-If GOAL is nil interactively, read it from the minibuffer."
+  "Begin an asynchronous Abdicate session.
+Interactively, read GOAL from the minibuffer if not supplied."
   (interactive)
   (when abdicate--current-session
-    (user-error "An abdicate session is already running"))
+    (user-error "An Abdicate session is already running"))
   (let ((g (or goal
                (if noninteractive
                    (or (car command-line-args-left)
@@ -310,6 +330,16 @@ If GOAL is nil interactively, read it from the minibuffer."
             (make-abdicate--session :goal g :errors nil :continue t :turn 0))
       (message "[abdicate] starting async session…")
       (abdicate--continue-session abdicate--current-session))))
+
+;;;###autoload
+(defun abdicate-abort ()
+  "Abort the current Abdicate session, if any."
+  (interactive)
+  (if (not abdicate--current-session)
+      (message "[abdicate] no active session to abort.")
+    (setf (abdicate--session-continue abdicate--current-session) nil)
+    (setq abdicate--current-session nil)
+    (message "[abdicate] session aborted.")))
 
 (provide 'abdicate)
 ;;; abdicate.el ends here
