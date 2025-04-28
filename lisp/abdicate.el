@@ -48,6 +48,7 @@
 ;; ------------------------------------------------------------------------
 ;; Helper: robust JSON key lookup.
 ;; ------------------------------------------------------------------------
+
 (defun abdicate--get (key alist)
   "Retrieve the value associated with KEY from ALIST.
 Try both symbol and string versions of KEY."
@@ -115,78 +116,78 @@ If CONTENT is a list or vector, search for an element whose \"type\" equals \"ou
 Otherwise, if CONTENT is a string, return it directly.
 Otherwise, signal an error."
   (cond
-   ((stringp content)
-    content)
+   ((stringp content) content)
    ((vectorp content)
-    (let ((result (cl-loop for item across content
-                           when (and (consp item)
-                                     (string= (or (alist-get 'type item) "") "output_text"))
-                           return (alist-get 'text item))))
-      (if (and result (stringp result))
-          result
+    (let ((result
+           (cl-loop for item across content
+                    when (and (consp item)
+                              (string= (or (alist-get 'type item) "") "output_text"))
+                    return (alist-get 'text item))))
+      (if (stringp result) result
         (error "Assistant content vector missing text field"))))
    ((listp content)
-    (let ((result (cl-loop for item in content
-                           when (and (consp item)
-                                     (string= (or (alist-get 'type item) "") "output_text"))
-                           return (alist-get 'text item))))
-      (if (and result (stringp result))
-          result
+    (let ((result
+           (cl-loop for item in content
+                    when (and (consp item)
+                              (string= (or (alist-get 'type item) "") "output_text"))
+                    return (alist-get 'text item))))
+      (if (stringp result) result
         (error "Assistant content list missing text field"))))
-   (t
-    (error "Invalid assistant content type: %s" (type-of content)))))
+   (t (error "Invalid assistant content type: %s" (type-of content)))))
 
 ;; ------------------------------------------------------------------------
-;; API call (Responses API, 2025) using built-in URL package instead of request
+;; API call (Responses API, 2025) using built-in URL package asynchronously
 ;; ------------------------------------------------------------------------
 
 (defun abdicate--query (goal snapshot)
-  "POST GOAL and SNAPSHOT; return parsed assistant JSON.
-Logs the raw response for debugging. Uses the built-in `url-retrieve-synchronously`
-to perform a synchronous HTTP request."
-  (let* ((input `[((type . "message") (role . "system")
-                   (content . ,(abdicate--system-prompt)))
-                  ((type . "message") (role . "user")
-                   (content . ,goal))
-                  ((type . "message") (role . "user")
-                   (content . ,snapshot))])
+  "POST GOAL and SNAPSHOT asynchronously; return parsed assistant JSON."
+  (let* ((input   `[((type . "message") (role . "system")  (content . ,(abdicate--system-prompt)))
+                   ((type . "message") (role . "user")    (content . ,goal))
+                   ((type . "message") (role . "user")    (content . ,snapshot))])
          (payload (abdicate--json `((model . ,abdicate-model)
-                                     (input . ,input))))
-         (url "https://api.openai.com/v1/responses"))
-    (setq url-request-method "POST")
-    (setq url-request-extra-headers
-          `(("Content-Type" . "application/json")
-            ("Authorization" . ,(concat "Bearer " abdicate-api-key))))
-    (setq url-request-data (encode-coding-string payload 'utf-8))
-    (let ((url-buffer (url-retrieve-synchronously url t t)))
-      (unless url-buffer
-        (error "Network error: no response buffer"))
-      (with-current-buffer url-buffer
-        (unwind-protect
-            (progn
-              (goto-char (point-min))
-              (unless (search-forward "\n\n" nil t)
-                (kill-buffer url-buffer)
-                (error "Response format error: header-body separator not found"))
-              (let* ((response-text (buffer-substring-no-properties (point) (point-max))))
-                (let* ((data (condition-case err
-                                 (json-read-from-string response-text)
-                               (json-error
-                                (error "Error parsing JSON response: %s" (error-message-string err)))))
-                       (output (alist-get 'output data))
-                       (msg (or (seq-find (lambda (it)
-                                              (string= (alist-get 'type it) "message"))
-                                            (reverse output))
-                                (error "No assistant message in response")))
-                       (raw-content (alist-get 'content msg))
-                       (content-str (abdicate--parse-assistant-content raw-content)))
-                  (message "Parsed assistant content: %s" content-str)
-                  (condition-case err
-                      (json-read-from-string content-str)
-                    (json-error
-                     (error "Assistant content not valid JSON: %s" content-str))))))
-          (when (buffer-live-p url-buffer)
-            (kill-buffer url-buffer)))))))
+                                    (input . ,input))))
+         (url     "https://api.openai.com/v1/responses")
+         done response-text status-alist)
+    ;; Prepare request
+    (let ((url-request-method        "POST")
+          (url-request-extra-headers `(("Content-Type" . "application/json")
+                                       ("Authorization" . ,(concat "Bearer " abdicate-api-key))))
+          (url-request-data          (encode-coding-string payload 'utf-8)))
+      ;; Kick off asynchronous fetch
+      (url-retrieve
+       url
+       (lambda (_status)
+         ;; Callback: extract body, record status and signal done
+         (setq status-alist (alist-get 'status _status))
+         (goto-char (point-min))
+         (when (search-forward "\n\n" nil t)
+           (setq response-text (buffer-substring-no-properties (point) (point-max))))
+         (kill-buffer)
+         (setq done t))
+       nil t))
+    ;; Wait for the callback to set `done'
+    (while (not done)
+      (accept-process-output nil 0.1))
+    ;; Ensure we got something
+    (unless response-text
+      (error "Network error or empty response"))
+    ;; Parse and return the assistant JSON payload
+    (let* ((data (condition-case err
+                     (json-read-from-string response-text)
+                   (json-error
+                    (error "Error parsing JSON response: %s"
+                           (error-message-string err)))))
+           (output (alist-get 'output data))
+           (msg    (or (seq-find (lambda (it)
+                                   (string= (alist-get 'type it) "message"))
+                                 (reverse output))
+                       (error "No assistant message in response")))
+           (raw    (alist-get 'content msg))
+           (txt    (abdicate--parse-assistant-content raw)))
+      (condition-case err
+          (json-read-from-string txt)
+        (json-error
+         (error "Assistant content not valid JSON: %s" txt))))))
 
 ;; ------------------------------------------------------------------------
 ;; Command execution with robust error handling and retry
@@ -207,16 +208,18 @@ message. In noninteractive mode the command is always auto-confirmed."
                     (setq result (eval form))
                     (message "Evaluation succeeded: %S => %S" form result))
                 (error
-                 (let ((err-msg (format "Error evaluating %S: %s" form (error-message-string err))))
+                 (let ((err-msg (format "Error evaluating %S: %s"
+                                        form (error-message-string err))))
                    (message "%s" err-msg)
                    (push err-msg abdicate--errors)
                    (setq result nil))))
               result)
-          (progn
-            (message "Skipping evaluation of: %S" form)
-            nil)))
-    (error (message "Unexpected error during evaluation of command: %s" (error-message-string outer))
-           nil)))
+          (message "Skipping evaluation of: %S" form)
+          nil))
+    (error
+     (message "Unexpected error during evaluation of command: %s"
+              (error-message-string outer))
+     nil)))
 
 ;; ------------------------------------------------------------------------
 ;; Interactive entry point
@@ -229,7 +232,7 @@ Commands that fail will have their error messages appended to the XML snapshot,
 which is passed along to the assistant.
 In noninteractive mode, the goal is taken from `command-line-args-left`."
   (interactive)
-  (setq abdicate--errors nil)  ; Reset error log.
+  (setq abdicate--errors nil)
   (unless (stringp abdicate-api-key)
     (setq abdicate-api-key
           (if noninteractive
@@ -239,8 +242,7 @@ In noninteractive mode, the goal is taken from `command-line-args-left`."
   (let* ((goal (if noninteractive
                    (or (car command-line-args-left)
                        (error "No goal provided in noninteractive mode"))
-                 (string-trim (read-string "What should the agent do? "))))
-         (done nil))
+                 (string-trim (read-string "Prompt: ")))))
     (unless (string-empty-p goal)
       (catch 'stop
         (while t
@@ -252,7 +254,8 @@ In noninteractive mode, the goal is taken from `command-line-args-left`."
               (error "Assistant JSON missing commands"))
             (dolist (c (if (vectorp cmds) (append cmds nil) cmds))
               (abdicate--eval c))
-            (unless (eq cont t) (throw 'stop t))))))))
+            (unless (eq cont t)
+              (throw 'stop t))))))))
 
 (provide 'abdicate)
 
