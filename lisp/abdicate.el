@@ -1,6 +1,6 @@
 ;;; abdicate.el --- LLM-driven Emacs agent (Responses API) -*- lexical-binding: t; -*-
 ;; Author: Grant Jenks <grant@example.com>
-;; Version: 0.3.2
+;; Version: 0.3.3
 ;; Package-Requires: ((emacs "28.1") (json "1.5") (cl-lib "0.6"))
 ;; Keywords: tools, convenience, ai
 ;; URL: https://github.com/YOURUSER/emacs-abdicate
@@ -195,30 +195,39 @@ Otherwise, signal an error."
 
 (defun abdicate--eval (cmd)
   "Read and evaluate CMD string.
-Logs the command before evaluation. If evaluation fails, records the error
-message. In noninteractive mode the command is always auto-confirmed."
+Logs the command before evaluation. If evaluation fails (including read errors),
+records the error message into `abdicate--errors` so that the next snapshot
+will include it."
   (condition-case outer
-      (let ((form (read cmd)))
-        (message "Command to eval: %S" form)
-        (if (or abdicate-auto-confirm noninteractive
-                (yes-or-no-p (format "Eval %S ? " form)))
-            (let ((result nil))
+      (let ((form
+             (condition-case err
+                 (read cmd)
+               (error
+                (let ((err-msg (format "Error reading command %S: %s" cmd (error-message-string err))))
+                  (message "%s" err-msg)
+                  (push err-msg abdicate--errors))
+                nil))))
+        (when form
+          (message "Command to eval: %S" form)
+          (if (or abdicate-auto-confirm noninteractive
+                  (yes-or-no-p (format "Eval %S ? " form)))
               (condition-case err
-                  (progn
-                    (setq result (eval form))
-                    (message "Evaluation succeeded: %S => %S" form result))
+                  (let ((result (eval form)))
+                    (message "Evaluation succeeded: %S => %S" form result)
+                    result)
                 (error
                  (let ((err-msg (format "Error evaluating %S: %s"
                                         form (error-message-string err))))
                    (message "%s" err-msg)
                    (push err-msg abdicate--errors)
-                   (setq result nil))))
-              result)
-          (message "Skipping evaluation of: %S" form)
-          nil))
+                   nil)))
+            (message "Skipping evaluation of: %S" form)
+            nil)))
     (error
-     (message "Unexpected error during evaluation of command: %s"
-              (error-message-string outer))
+     (let ((err-msg (format "Unexpected error during evaluation of command: %s"
+                            (error-message-string outer))))
+       (message "%s" err-msg)
+       (push err-msg abdicate--errors))
      nil)))
 
 ;; ------------------------------------------------------------------------
@@ -228,9 +237,9 @@ message. In noninteractive mode the command is always auto-confirmed."
 ;;;###autoload
 (defun abdicate ()
   "Start an LLM-driven editing loop with robust error recording and retry on failures.
-Commands that fail will have their error messages appended to the XML snapshot,
-which is passed along to the assistant.
-In noninteractive mode, the goal is taken from `command-line-args-left`."
+If any command read or evaluation error occurs, the error is recorded and
+included in the next snapshot sent to the LLM, forcing it to correct itself.
+Continue until the assistant returns continue=false *and* no errors are present."
   (interactive)
   (setq abdicate--errors nil)
   (unless (stringp abdicate-api-key)
@@ -252,10 +261,16 @@ In noninteractive mode, the goal is taken from `command-line-args-left`."
                  (cont     (abdicate--get 'continue reply)))
             (unless (or (listp cmds) (vectorp cmds))
               (error "Assistant JSON missing commands"))
+            ;; Execute each command, errors (read or eval) go into abdicate--errors
             (dolist (c (if (vectorp cmds) (append cmds nil) cmds))
               (abdicate--eval c))
-            (unless (eq cont t)
-              (throw 'stop t))))))))
+            ;; Decide whether to stop:
+            ;;   - If there were any errors, always retry (regardless of cont)
+            ;;   - Otherwise, if cont is false, we're done
+            (if (and (null abdicate--errors) (not cont))
+                (throw 'stop t)
+              (when abdicate--errors
+                (message "[abdicate] Detected errors, retrying...")))))))))
 
 (provide 'abdicate)
 
