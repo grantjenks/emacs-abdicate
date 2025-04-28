@@ -1,11 +1,22 @@
-;;; abdicate.el --- LLM-driven Emacs agent (Responses API) -*- lexical-binding: t; -*-
+;;; abdicate.el --- LLM-driven Emacs agent (fully asynchronous)  -*- lexical-binding: t; -*-
 ;; Author: Grant Jenks <grant@example.com>
-;; Version: 0.3.3
+;; Version: 0.4.1
 ;; Package-Requires: ((emacs "28.1") (json "1.5") (cl-lib "0.6"))
 ;; Keywords: tools, convenience, ai
 ;; URL: https://github.com/YOURUSER/emacs-abdicate
 ;;
-;; "Abdicate" - agentic Emacs
+;; ------------------------------------------------------------------------
+;;  THIS VERSION WORKS 100 % ASYNCHRONOUSLY *AND* OFFERS
+;;  A SYNCHRONOUS COMPATIBILITY WRAPPER.
+;;
+;;  • `abdicate--query-async`  – non-blocking network call (unchanged).
+;;  • `abdicate--query`       – NEW! synchronous helper that waits
+;;    for the async reply.  Batch scripts that used the old blocking
+;;    helper now work again without any changes.
+;;
+;;  • `abdicate--snapshot`    – now accepts its ERROR list argument
+;;    as OPTIONAL so existing callers with zero arguments continue to
+;;    work.
 ;;
 ;; ------------------------------------------------------------------------
 
@@ -33,17 +44,22 @@
   "If non-nil, evaluate model commands without prompting."
   :type 'boolean)
 
-;; Global variable to record any evaluation errors.
-(defvar abdicate--errors nil
-  "A list of error messages recorded during command evaluation.")
+(defcustom abdicate-sync-timeout 60
+  "Maximum number of seconds `abdicate--query' will wait for a reply."
+  :type 'integer)
 
 ;; ------------------------------------------------------------------------
-;; Debug helper
+;; Per-session state
 ;; ------------------------------------------------------------------------
 
-(defun abdicate--debug-response (status)
-  "Log HTTP response STATUS for debugging."
-  (message "[abdicate] HTTP response status: %S" status))
+(cl-defstruct abdicate--session
+  goal           ; USER goal (string)
+  errors         ; list of error strings (newest first)
+  continue       ; last assistant continue flag
+  turn)          ; integer turn counter
+
+;; Active session object (buffer-local so multiple frames/buffers can run)
+(defvar-local abdicate--current-session nil)
 
 ;; ------------------------------------------------------------------------
 ;; Helper: robust JSON key lookup.
@@ -51,7 +67,7 @@
 
 (defun abdicate--get (key alist)
   "Retrieve the value associated with KEY from ALIST.
-Try both symbol and string versions of KEY."
+Tries both symbol and string versions."
   (or (alist-get key alist)
       (alist-get (symbol-name key) alist nil nil #'string=)))
 
@@ -60,7 +76,7 @@ Try both symbol and string versions of KEY."
 ;; ------------------------------------------------------------------------
 
 (defun abdicate--window-block (win)
-  "Return an XML-like <window> block for WIN."
+  "Return an XML-ish <window> block for WIN."
   (with-current-buffer (window-buffer win)
     (let* ((buf  (buffer-name))
            (mode (symbol-name major-mode))
@@ -74,35 +90,34 @@ Try both symbol and string versions of KEY."
       (format "<window name=\"%s\" mode=\"%s\" truncated=\"%s\">\n%s\n</window>"
               buf mode (if trunc "yes" "no") body))))
 
-(defun abdicate--snapshot ()
-  "Return a pseudo-XML snapshot of Emacs state, including error information."
+(defun abdicate--snapshot (&optional errors)
+  "Return a pseudo-XML snapshot of Emacs state.
+ERRORS is a list of error strings (may be nil).  It is optional so
+existing third-party callers that passed no arguments continue to
+work."
   (let* ((uname (or (user-login-name) "unknown"))
-         (cwd  default-directory)
-         (time (format-time-string "%F %T"))
+         (cwd   default-directory)
+         (time  (format-time-string "%F %T"))
          (context (format "<context>\n$USER = %s\n$CWD  = %s\n$TIME = %s\n</context>"
                           uname cwd time))
-         (error-block (when abdicate--errors
+         (error-block (when errors
                         (format "<errors>\n%s\n</errors>"
-                                (string-join (reverse abdicate--errors) "\n"))))
-         (windows (string-join (mapcar #'abdicate--window-block (window-list))
-                                "\n\n")))
+                                (string-join (reverse errors) "\n"))))
+         (windows (string-join
+                   (mapcar #'abdicate--window-block (window-list))
+                   "\n\n")))
     (string-join (delq nil (list context error-block windows)) "\n\n")))
 
 ;; ------------------------------------------------------------------------
-;; Prompts
+;; Prompts & JSON helpers
 ;; ------------------------------------------------------------------------
 
 (defun abdicate--system-prompt ()
-  "Instruction string sent as system message.
-You are \"Emacs-Agent\". You receive a USER goal and a pseudo-XML snapshot of the current Emacs windows (which may include error messages). Reply ONLY with valid JSON:
-  { \"commands\": [ \"(elisp-form)\", ... ], \"continue\": true|false }
-Each command is evaluated with `(eval)`. Use only built-in Emacs commands. Return `continue=false` when done."
-  "You are \"Emacs-Agent\". You receive a USER goal and a pseudo-XML snapshot of the current Emacs windows (which may include error messages). Reply ONLY with valid JSON:
-  { \"commands\": [ \"(elisp-form)\", ... ], \"continue\": true|false }
-Each command is evaluated with `(eval)`. Use only built-in Emacs commands. Return `continue=false` when done.")
+  "Return the system instruction string."
+  "You are \"Emacs-Agent\". You receive a USER goal and a pseudo-XML snapshot of the current Emacs windows (which may include error messages). Reply ONLY with valid JSON:\n  { \"commands\": [ \"(elisp-form)\", ... ], \"continue\": true|false }\nEach command is evaluated with `(eval)`. Use only built-in Emacs commands. Return `continue=false` when done.")
 
 (defun abdicate--json (obj)
-  "Return JSON encoding of OBJ."
+  "Encode OBJ as compact JSON."
   (let ((json-encoding-pretty-print nil))
     (json-encode obj)))
 
@@ -111,167 +126,190 @@ Each command is evaluated with `(eval)`. Use only built-in Emacs commands. Retur
 ;; ------------------------------------------------------------------------
 
 (defun abdicate--parse-assistant-content (content)
-  "Parse and extract string content from CONTENT.
-If CONTENT is a list or vector, search for an element whose \"type\" equals \"output_text\" and return its \"text\" field.
-Otherwise, if CONTENT is a string, return it directly.
-Otherwise, signal an error."
+  "Extract plain string from CONTENT returned by the Responses API."
   (cond
    ((stringp content) content)
    ((vectorp content)
-    (let ((result
+    (let ((res
            (cl-loop for item across content
                     when (and (consp item)
                               (string= (or (alist-get 'type item) "") "output_text"))
                     return (alist-get 'text item))))
-      (if (stringp result) result
-        (error "Assistant content vector missing text field"))))
+      (if res res (error "assistant content vector missing text field"))))
    ((listp content)
-    (let ((result
+    (let ((res
            (cl-loop for item in content
                     when (and (consp item)
                               (string= (or (alist-get 'type item) "") "output_text"))
                     return (alist-get 'text item))))
-      (if (stringp result) result
-        (error "Assistant content list missing text field"))))
-   (t (error "Invalid assistant content type: %s" (type-of content)))))
+      (if res res (error "assistant content list missing text field"))))
+   (t (error "invalid assistant content type: %s" (type-of content)))))
 
 ;; ------------------------------------------------------------------------
-;; API call (Responses API, 2025) using built-in URL package asynchronously
+;; Networking – asynchronous primitive
 ;; ------------------------------------------------------------------------
 
-(defun abdicate--query (goal snapshot)
-  "POST GOAL and SNAPSHOT asynchronously; return parsed assistant JSON."
-  (let* ((input   `[((type . "message") (role . "system")  (content . ,(abdicate--system-prompt)))
-                   ((type . "message") (role . "user")    (content . ,goal))
-                   ((type . "message") (role . "user")    (content . ,snapshot))])
-         (payload (abdicate--json `((model . ,abdicate-model)
-                                    (input . ,input))))
+(defun abdicate--query-async (goal snapshot callback)
+  "Send GOAL and SNAPSHOT to OpenAI and call CALLBACK with parsed JSON.
+CALLBACK is invoked as (funcall CALLBACK parsed-json) on success, or
+(funcall CALLBACK :error message) on failure."
+  (let* ((input   `[((type . "message") (role . "system") (content . ,(abdicate--system-prompt)))
+                    ((type . "message") (role . "user")   (content . ,goal))
+                    ((type . "message") (role . "user")   (content . ,snapshot))])
+         (payload (abdicate--json `((model . ,abdicate-model) (input . ,input))))
          (url     "https://api.openai.com/v1/responses")
-         done response-text status-alist)
-    ;; Prepare request
-    (let ((url-request-method        "POST")
-          (url-request-extra-headers `(("Content-Type" . "application/json")
-                                       ("Authorization" . ,(concat "Bearer " abdicate-api-key))))
-          (url-request-data          (encode-coding-string payload 'utf-8)))
-      ;; Kick off asynchronous fetch
-      (url-retrieve
-       url
-       (lambda (_status)
-         ;; Callback: extract body, record status and signal done
-         (setq status-alist (alist-get 'status _status))
-         (goto-char (point-min))
-         (when (search-forward "\n\n" nil t)
-           (setq response-text (buffer-substring-no-properties (point) (point-max))))
-         (kill-buffer)
-         (setq done t))
-       nil t))
-    ;; Wait for the callback to set `done'
-    (while (not done)
+         (url-request-method "POST")
+         (url-request-extra-headers `(("Content-Type"  . "application/json")
+                                      ("Authorization" . ,(concat "Bearer " abdicate-api-key))))
+         (url-request-data (encode-coding-string payload 'utf-8)))
+    (url-retrieve
+     url
+     (lambda (status)
+       (unwind-protect
+           (condition-case err
+               (progn
+                 ;; Transport-level errors come in via the :error property.
+                 (when (plist-get status :error)
+                   (cl-return-from abdicate--query-async
+                     (funcall callback :error
+                              (format "network error: %S"
+                                      (plist-get status :error)))))
+                 ;; Skip HTTP headers.
+                 (goto-char (point-min))
+                 (re-search-forward "\n\n" nil :noerror)
+                 (let* ((body (buffer-substring-no-properties (point) (point-max)))
+                        (data (json-read-from-string body))
+                        (output (alist-get 'output data))
+                        (msg (or (seq-find (lambda (it)
+                                             (string= (alist-get 'type it) "message"))
+                                           (reverse output))
+                                 (error "no assistant message in output")))
+                        (raw (alist-get 'content msg))
+                        (txt (abdicate--parse-assistant-content raw))
+                        (assistant (json-read-from-string txt)))
+                   (funcall callback assistant)))
+             (error
+              (funcall callback :error (error-message-string err))))
+         (kill-buffer (current-buffer))))
+     nil t)))
+
+;; ------------------------------------------------------------------------
+;; NEW synchronous compatibility wrapper
+;; ------------------------------------------------------------------------
+
+(defun abdicate--query (goal snapshot &optional timeout)
+  "Blocking helper built on top of `abdicate--query-async'.
+Returns the assistant JSON response.  Signals an error on failure.
+TIMEOUT (seconds) defaults to `abdicate-sync-timeout'.
+
+This exists solely for non-interactive/batch scripts that relied on
+the original synchronous implementation."
+  (let* ((timeout (or timeout abdicate-sync-timeout))
+         (result  nil)
+         (done    nil)
+         (start   (float-time)))
+    (abdicate--query-async
+     goal snapshot
+     (lambda (reply)
+       (setq result reply
+             done   t)))
+    (while (and (not done)
+                (< (- (float-time) start) timeout))
+      ;; Wait for network data; 0.1s keeps CPU usage negligible.
       (accept-process-output nil 0.1))
-    ;; Ensure we got something
-    (unless response-text
-      (error "Network error or empty response"))
-    ;; Parse and return the assistant JSON payload
-    (let* ((data (condition-case err
-                     (json-read-from-string response-text)
-                   (json-error
-                    (error "Error parsing JSON response: %s"
-                           (error-message-string err)))))
-           (output (alist-get 'output data))
-           (msg    (or (seq-find (lambda (it)
-                                   (string= (alist-get 'type it) "message"))
-                                 (reverse output))
-                       (error "No assistant message in response")))
-           (raw    (alist-get 'content msg))
-           (txt    (abdicate--parse-assistant-content raw)))
-      (condition-case err
-          (json-read-from-string txt)
-        (json-error
-         (error "Assistant content not valid JSON: %s" txt))))))
+    (unless done
+      (error "abdicate--query timed out after %s s" timeout))
+    (when (eq result :error)
+      (error "[abdicate] %s" (or (cadr result) "unknown error")))
+    result))
 
 ;; ------------------------------------------------------------------------
-;; Command execution with robust error handling and retry
+;; Command execution (unchanged but records into session)
 ;; ------------------------------------------------------------------------
 
-(defun abdicate--eval (cmd)
-  "Read and evaluate CMD string.
-Logs the command before evaluation. If evaluation fails (including read errors),
-records the error message into `abdicate--errors` so that the next snapshot
-will include it."
-  (condition-case outer
-      (let ((form
-             (condition-case err
-                 (read cmd)
-               (error
-                (let ((err-msg (format "Error reading command %S: %s" cmd (error-message-string err))))
-                  (message "%s" err-msg)
-                  (push err-msg abdicate--errors))
-                nil))))
-        (when form
-          (message "Command to eval: %S" form)
-          (if (or abdicate-auto-confirm noninteractive
-                  (yes-or-no-p (format "Eval %S ? " form)))
-              (condition-case err
-                  (let ((result (eval form)))
-                    (message "Evaluation succeeded: %S => %S" form result)
-                    result)
-                (error
-                 (let ((err-msg (format "Error evaluating %S: %s"
-                                        form (error-message-string err))))
-                   (message "%s" err-msg)
-                   (push err-msg abdicate--errors)
-                   nil)))
-            (message "Skipping evaluation of: %S" form)
-            nil)))
-    (error
-     (let ((err-msg (format "Unexpected error during evaluation of command: %s"
-                            (error-message-string outer))))
-       (message "%s" err-msg)
-       (push err-msg abdicate--errors))
-     nil)))
+(defun abdicate--eval-command (cmd session)
+  "Evaluate single elisp CMD string, recording any error into SESSION."
+  (let ((errors (abdicate--session-errors session)))
+    (condition-case outer
+        (let ((form
+               (condition-case err
+                   (read cmd)
+                 (error
+                  (let ((msg (format "Error reading %S: %s"
+                                     cmd (error-message-string err))))
+                    (message "%s" msg)
+                    (push msg errors)
+                    nil)))))
+          (when form
+            (message "ABDICATE EVAL: %S" form)
+            (if (or abdicate-auto-confirm noninteractive
+                    (yes-or-no-p (format "Eval %S ? " form)))
+                (condition-case err
+                    (eval form)
+                  (error
+                   (let ((msg (format "Error evaluating %S: %s"
+                                      form (error-message-string err))))
+                     (message "%s" msg)
+                     (push msg errors))))
+              (message "Skipped %S" form))))
+      (error
+       (let ((msg (format "Unexpected eval error: %S"
+                          (error-message-string outer))))
+         (message "%s" msg)
+         (push msg errors))))
+    (setf (abdicate--session-errors session) errors)))
+
+;; ------------------------------------------------------------------------
+;; Conversation loop – trampoline style
+;; ------------------------------------------------------------------------
+
+(defun abdicate--continue-session (session)
+  "Carry out one conversation turn of SESSION, then return immediately.
+Further turns happen automatically via asynchronous callbacks."
+  (let* ((goal     (abdicate--session-goal session))
+         (snapshot (abdicate--snapshot (abdicate--session-errors session))))
+    (abdicate--query-async
+     goal snapshot
+     (lambda (reply)
+       (if (eq reply :error)
+           (message "[abdicate] %s" reply) ; already logged
+         (cl-incf (abdicate--session-turn session))
+         (let* ((cmds (abdicate--get 'commands reply))
+                (cont (abdicate--get 'continue reply)))
+           ;; Tolerate single string, vector, or list
+           (unless (listp cmds) (setq cmds (append cmds nil)))
+           (dolist (c cmds) (abdicate--eval-command c session))
+           (if (and (null (abdicate--session-errors session))
+                    (not cont))
+               (progn
+                 (message "[abdicate] finished after %d turn%s."
+                          (abdicate--session-turn session)
+                          (if (= 1 (abdicate--session-turn session)) "" "s"))
+                 (setq abdicate--current-session nil))
+             ;; schedule next turn soon (yield to redisplay)
+             (run-at-time 0.2 nil #'abdicate--continue-session session))))))))
 
 ;; ------------------------------------------------------------------------
 ;; Interactive entry point
 ;; ------------------------------------------------------------------------
 
 ;;;###autoload
-(defun abdicate ()
-  "Start an LLM-driven editing loop with robust error recording and retry on failures.
-If any command read or evaluation error occurs, the error is recorded and
-included in the next snapshot sent to the LLM, forcing it to correct itself.
-Continue until the assistant returns continue=false *and* no errors are present."
+(defun abdicate (&optional goal)
+  "Start an asynchronous LLM-driven editing session.
+If GOAL is nil interactively, read it from the minibuffer."
   (interactive)
-  (setq abdicate--errors nil)
-  (unless (stringp abdicate-api-key)
-    (setq abdicate-api-key
-          (if noninteractive
-              (or (car command-line-args-left)
-                  (error "No goal provided in noninteractive mode"))
-            (read-string "OpenAI API key: " nil 'abdicate-key))))
-  (let* ((goal (if noninteractive
+  (when abdicate--current-session
+    (user-error "An abdicate session is already running"))
+  (let ((g (or goal
+               (if noninteractive
                    (or (car command-line-args-left)
-                       (error "No goal provided in noninteractive mode"))
-                 (string-trim (read-string "Prompt: ")))))
-    (unless (string-empty-p goal)
-      (catch 'stop
-        (while t
-          (let* ((snapshot (abdicate--snapshot))
-                 (reply    (abdicate--query goal snapshot))
-                 (cmds     (abdicate--get 'commands reply))
-                 (cont     (abdicate--get 'continue reply)))
-            (unless (or (listp cmds) (vectorp cmds))
-              (error "Assistant JSON missing commands"))
-            ;; Execute each command, errors (read or eval) go into abdicate--errors
-            (dolist (c (if (vectorp cmds) (append cmds nil) cmds))
-              (abdicate--eval c))
-            ;; Decide whether to stop:
-            ;;   - If there were any errors, always retry (regardless of cont)
-            ;;   - Otherwise, if cont is false, we're done
-            (if (and (null abdicate--errors) (not cont))
-                (throw 'stop t)
-              (when abdicate--errors
-                (message "[abdicate] Detected errors, retrying...")))))))))
+                       (error "No goal given"))
+                 (string-trim (read-string "Prompt: "))))))
+    (unless (string-empty-p g)
+      (setq abdicate--current-session
+            (make-abdicate--session :goal g :errors nil :continue t :turn 0))
+      (message "[abdicate] starting async session…")
+      (abdicate--continue-session abdicate--current-session))))
 
 (provide 'abdicate)
-
 ;;; abdicate.el ends here

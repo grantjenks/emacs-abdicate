@@ -1,4 +1,4 @@
-;;; abdicate-test.el --- Basic ERT tests for abdicate.el -*- lexical-binding: t; -*-
+;;; test/abdicate-test.el --- Basic ERT tests for abdicate.el -*- lexical-binding: t; -*-
 ;;
 ;; Tests that core non-network functions behave as expected.
 
@@ -22,7 +22,8 @@
 
 (ert-deftest abdicate-snapshot-basic ()
   "Snapshot should include context tags and at least one window block."
-  (let ((snap (abdicate--snapshot)))
+  ;; Pass NIL for the error list argument that `abdicate--snapshot' now expects.
+  (let ((snap (abdicate--snapshot nil)))
     (should (stringp snap))
     (should (string-match-p "<context>" snap))
     (should (string-match-p "</context>" snap))
